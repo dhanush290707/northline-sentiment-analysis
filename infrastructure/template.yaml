@@ -1,0 +1,446 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Northline shop, reviews, and Amazon Comprehend sentiment for shop owners.
+
+Parameters:
+  NegativeEscalationThreshold:
+    Type: String
+    Default: "0.75"
+    Description: Negative confidence at or above this value escalates a review.
+  EnableCloudFront:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Set true only if this account can create CloudFront distributions.
+
+Conditions:
+  UseCloudFront: !Equals [!Ref EnableCloudFront, "true"]
+
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Architectures:
+      - x86_64
+    Timeout: 30
+    MemorySize: 256
+    Tracing: PassThrough
+
+Resources:
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${AWS::StackName}-users"
+      UsernameAttributes:
+        - email
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+        - Name: name
+          AttributeDataType: String
+          Mutable: true
+          Required: false
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      LambdaConfig:
+        PreSignUp: !GetAtt PreSignupFunction.Arn
+
+  PreSignupFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend
+      Handler: src/pre-signup.handler
+      Description: Confirms new Northline customers without an email round trip.
+
+  PreSignupPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt PreSignupFunction.Arn
+      Principal: cognito-idp.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${AWS::StackName}-web"
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      SupportedIdentityProviders:
+        - COGNITO
+
+  AdminsGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: admins
+      Description: Shop owners who can read sentiment and manage escalation.
+      UserPoolId: !Ref UserPool
+
+  CustomersGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: customers
+      Description: Shoppers. Admin rights are not granted by this group.
+      UserPoolId: !Ref UserPool
+
+  AppTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: gsi1pk
+          AttributeType: S
+        - AttributeName: gsi1sk
+          AttributeType: S
+        - AttributeName: gsi2pk
+          AttributeType: S
+        - AttributeName: gsi2sk
+          AttributeType: S
+        - AttributeName: gsi3pk
+          AttributeType: S
+        - AttributeName: gsi3sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: gsi1
+          KeySchema:
+            - AttributeName: gsi1pk
+              KeyType: HASH
+            - AttributeName: gsi1sk
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: gsi2
+          KeySchema:
+            - AttributeName: gsi2pk
+              KeyType: HASH
+            - AttributeName: gsi2sk
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: gsi3
+          KeySchema:
+            - AttributeName: gsi3pk
+              KeyType: HASH
+            - AttributeName: gsi3sk
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default
+      CorsConfiguration:
+        AllowOrigins:
+          - "*"
+        AllowHeaders:
+          - authorization
+          - content-type
+        AllowMethods:
+          - GET
+          - POST
+          - PUT
+          - PATCH
+          - OPTIONS
+        MaxAge: 600
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
+              audience:
+                - !Ref UserPoolClient
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend
+      Handler: src/handler.handler
+      Description: Northline catalog, orders, reviews, Comprehend, and admin analytics.
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref AppTable
+          NEGATIVE_ESCALATION_THRESHOLD: !Ref NegativeEscalationThreshold
+          USER_POOL_ID: !Ref UserPool
+          USER_POOL_CLIENT_ID: !Ref UserPoolClient
+          ESCALATION_TOPIC_ARN: !Ref EscalationTopic
+          ALLOWED_ORIGIN: "*"
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AppTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - comprehend:DetectSentiment
+                - comprehend:DetectDominantLanguage
+                - comprehend:DetectTargetedSentiment
+              Resource: "*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sns:Publish
+              Resource: !Ref EscalationTopic
+      Events:
+        Health:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /health
+            PayloadFormatVersion: "2.0"
+            Auth:
+              Authorizer: NONE
+        GetProducts:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /products
+            PayloadFormatVersion: "2.0"
+            Auth:
+              Authorizer: NONE
+        GetProduct:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /products/{id}
+            PayloadFormatVersion: "2.0"
+            Auth:
+              Authorizer: NONE
+        GetReviews:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /products/{id}/reviews
+            PayloadFormatVersion: "2.0"
+            Auth:
+              Authorizer: NONE
+        PostReview:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: POST
+            Path: /products/{id}/reviews
+            PayloadFormatVersion: "2.0"
+        PostOrder:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: POST
+            Path: /orders
+            PayloadFormatVersion: "2.0"
+        GetOrders:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /orders
+            PayloadFormatVersion: "2.0"
+        GetOrder:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /orders/{id}
+            PayloadFormatVersion: "2.0"
+        GetMe:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /me
+            PayloadFormatVersion: "2.0"
+        PutMe:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: PUT
+            Path: /me
+            PayloadFormatVersion: "2.0"
+        GetMyReviews:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /me/reviews
+            PayloadFormatVersion: "2.0"
+        AdminDashboard:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /admin/dashboard
+            PayloadFormatVersion: "2.0"
+        AdminReviews:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /admin/reviews
+            PayloadFormatVersion: "2.0"
+        AdminNegative:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /admin/reviews/negative
+            PayloadFormatVersion: "2.0"
+        AdminReview:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /admin/reviews/{reviewId}
+            PayloadFormatVersion: "2.0"
+        AdminStatus:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: PATCH
+            Path: /admin/reviews/{reviewId}/status
+            PayloadFormatVersion: "2.0"
+        AdminProduct:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /admin/products/{id}/sentiment
+            PayloadFormatVersion: "2.0"
+
+  EscalationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-escalations"
+      DisplayName: Northline escalations
+
+  EscalationEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref EscalationTopic
+      Endpoint: 1ryaningem8@gmail.com
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  FrontendOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Condition: UseCloudFront
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    Condition: UseCloudFront
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: frontend
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt FrontendOAC.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: frontend
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          ForwardedValues:
+            QueryString: false
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: UseCloudFront
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFront
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}"
+
+Outputs:
+  ApiUrl:
+    Description: HTTP API base URL. Put this in VITE_API_BASE_URL.
+    Value: !GetAtt HttpApi.ApiEndpoint
+  UserPoolId:
+    Description: Cognito user pool id.
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Description: Cognito app client id. This client has no secret.
+    Value: !Ref UserPoolClient
+  TableName:
+    Description: DynamoDB table name.
+    Value: !Ref AppTable
+  FrontendBucket:
+    Description: Private bucket for the built React app.
+    Value: !Ref FrontendBucket
+  EscalationTopicArn:
+    Description: SNS topic that receives escalated reviews.
+    Value: !Ref EscalationTopic
+  CloudFrontUrl:
+    Condition: UseCloudFront
+    Description: Public storefront URL when CloudFront is enabled.
+    Value: !GetAtt FrontendDistribution.DomainName

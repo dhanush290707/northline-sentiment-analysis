@@ -1,0 +1,10 @@
+{
+  "name": "northline",
+  "private": true,
+  "scripts": {
+    "dev:api": "npm --prefix backend run dev",
+    "dev:web": "npm --prefix frontend run dev",
+    "test": "npm --prefix backend test",
+    "seed": "npm --prefix backend run seed"
+  }
+}
